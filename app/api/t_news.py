@@ -12,6 +12,8 @@ FastAPI-приложение для инспекции собранных нов
 import logging
 from contextlib import asynccontextmanager
 
+from datetime import datetime, timezone, timedelta
+
 from fastapi import Depends, FastAPI
 from sqlalchemy.orm import Session
 
@@ -19,6 +21,15 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.news import RawNews
 from app.services.scheduler import start_background_collector
+
+MSK = timezone(timedelta(hours=3))
+
+
+def _to_msk_iso(dt) -> str | None:
+    """Конвертирует naive UTC datetime в ISO строку МСК."""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).astimezone(MSK).isoformat()
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +85,10 @@ def recent_news(limit: int = 20, db: Session = Depends(get_db)):
             "id": row.id,
             "source": row.source,
             "title": row.title,
-            "published_at": row.published_at.isoformat() if row.published_at else None,
+            "published_at": _to_msk_iso(row.published_at),
             "source_url": row.source_url,
             "external_id": row.external_id,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "created_at": _to_msk_iso(row.created_at),
         }
         for row in rows
     ]

@@ -141,18 +141,44 @@ def _migrate_database():
     # Проверяем колонки raw_news
     columns = {row[1] for row in conn.execute("PRAGMA table_info(raw_news)").fetchall()}
 
-    # SQLite не даёт DROP COLUMN с FK — пересоздаём таблицу
-    if "processed_id" in columns or "processed" in columns:
+    # Проверяем что id имеет PRIMARY KEY AUTOINCREMENT
+    id_info = conn.execute("PRAGMA table_info(raw_news)").fetchone()
+    id_has_pk = id_info and id_info[5] == 1  # pk=1 means PRIMARY KEY
+    has_is_processed = "is_processed" in columns
+
+    # Миграция нужна только если таблица ещё не обновлена
+    needs_recreate = (not has_is_processed or not id_has_pk) and ("processed_id" in columns or "processed" in columns or not id_has_pk)
+    if needs_recreate:
+        # Копируем данные
+        conn.execute("CREATE TEMPORARY TABLE _raw_news_backup AS SELECT * FROM raw_news")
+        conn.execute("DROP TABLE raw_news")
+        # Создаём с правильной схемой (PRIMARY KEY AUTOINCREMENT)
         conn.execute("""
-            CREATE TABLE raw_news_new AS
+            CREATE TABLE raw_news (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title VARCHAR(512) NOT NULL,
+                full_text TEXT NOT NULL,
+                source VARCHAR(100) NOT NULL,
+                source_url VARCHAR(512),
+                published_at DATETIME,
+                external_id VARCHAR(128),
+                is_duplicate BOOLEAN NOT NULL DEFAULT 0,
+                hash_content VARCHAR(64),
+                created_at DATETIME NOT NULL,
+                is_processed BOOLEAN NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            INSERT INTO raw_news (id, title, full_text, source, source_url, published_at,
+                                  external_id, is_duplicate, hash_content, created_at)
             SELECT id, title, full_text, source, source_url, published_at,
                    external_id, is_duplicate, hash_content, created_at
-            FROM raw_news
+            FROM _raw_news_backup
         """)
-        conn.execute("DROP TABLE raw_news")
-        conn.execute("ALTER TABLE raw_news_new RENAME TO raw_news")
+        conn.execute("DROP TABLE _raw_news_backup")
         conn.execute("CREATE INDEX IF NOT EXISTS ix_raw_news_external_id ON raw_news(external_id)")
-        print("  [миграция] Пересоздана таблица raw_news (без processed_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_raw_news_is_processed ON raw_news(is_processed)")
+        print("  [миграция] Пересоздана таблица raw_news (PRIMARY KEY AUTOINCREMENT)")
 
     # Добавляем is_processed если нет
     columns = {row[1] for row in conn.execute("PRAGMA table_info(raw_news)").fetchall()}

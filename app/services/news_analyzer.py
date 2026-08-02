@@ -86,11 +86,17 @@ def _extract_tickers(item: dict) -> tuple[str, str]:
     Возвращает (tickers_str, primary_ticker).
     """
     raw = item.get("tickers", "")
+    tickers_list = []
+
     if isinstance(raw, dict):
         # Формат {"ticker": "SBER"} или {"ticker": ["SBER", "GAZP"]}
-        tickers_list = raw.get("ticker", [])
-        if isinstance(tickers_list, str):
-            tickers_list = [tickers_list]
+        val = raw.get("ticker", [])
+        if isinstance(val, str):
+            tickers_list = [val]
+        elif isinstance(val, list):
+            tickers_list = val
+        else:
+            tickers_list = [str(val)] if val else []
     elif isinstance(raw, str):
         tickers_list = [t.strip() for t in raw.split(",") if t.strip()]
     elif isinstance(raw, list):
@@ -98,8 +104,22 @@ def _extract_tickers(item: dict) -> tuple[str, str]:
     else:
         tickers_list = []
 
-    tickers_str = ",".join(str(t).upper() for t in tickers_list)
-    primary = tickers_list[0].upper() if tickers_list else ""
+    # Нормализуем: извлекаем строковые значения из любых вложенных объектов
+    normalized = []
+    for t in tickers_list:
+        if isinstance(t, dict):
+            # Если внутри dict — берём любое строковое значение
+            for v in t.values():
+                if isinstance(v, str) and v:
+                    normalized.append(v.upper())
+                    break
+        elif isinstance(t, str) and t:
+            normalized.append(t.upper())
+        elif t is not None:
+            normalized.append(str(t).upper())
+
+    tickers_str = ",".join(normalized)
+    primary = normalized[0] if normalized else ""
     return tickers_str, primary
 
 

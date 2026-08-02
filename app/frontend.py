@@ -20,10 +20,20 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import logging
+from datetime import datetime, timezone, timedelta
 
 import streamlit as st
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
+
+MSK = timezone(timedelta(hours=3))  # Московское время
+
+
+def _to_msk(dt) -> str:
+    """Конвертирует naive UTC datetime в строку МСК."""
+    if dt is None:
+        return "—"
+    return dt.replace(tzinfo=timezone.utc).astimezone(MSK).strftime("%d.%m.%Y %H:%M")
 
 from app.core.config import settings
 from app.core.database import get_db_context
@@ -220,8 +230,12 @@ if st.session_state.update_msg:
 
 if last_update is not None:
     st.sidebar.caption(
-        f"Последнее обновление БД: {last_update:%d.%m.%Y %H:%M:%S} UTC"
+        f"Последнее обновление БД: {_to_msk(last_update)} МСК"
     )
+
+# Текущее время МСК
+now_msk = datetime.now(MSK)
+st.sidebar.caption(f"Текущее время: {now_msk:%H:%M:%S} МСК")
 st.sidebar.caption("Фоновый сбор: каждые %d сек" % settings.COLLECT_INTERVAL_SECONDS)
 
 # --- Основная часть ---
@@ -265,7 +279,7 @@ st.plotly_chart(fig, width="stretch")
 st.subheader(f"Новости по {ticker}")
 if news:
     for src, published_at, title in news:
-        when = published_at.strftime("%d.%m.%Y %H:%M") if published_at else "—"
-        st.markdown(f"- **[{src}]** ({when}) {title}")
+        when = _to_msk(published_at)
+        st.markdown(f"- **[{src}]** ({when} МСК) {title}")
 else:
     st.caption("Новостей с этим тикером пока нет.")
