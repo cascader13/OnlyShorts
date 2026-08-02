@@ -4,11 +4,16 @@ Streamlit-дашборд рыночных данных.
 Запуск:
     streamlit run app/frontend.py
 
-Показывает свечные графики по тикеру (SMA/объём/RSI) из таблицы candles и
-ленту последних новостей по тикеру из raw_news. Кнопка «Обновить данные»
+Вкладка «Рынок»: свечные графики по тикеру (SMA/объём/RSI) из таблицы candles и
+лента последних новостей по тикеру из raw_news. Кнопка «Обновить данные»
 вызывает разовый сбор свечей через T-Invest SDK.
 
+Вкладка «Байесовские сети»: генерация сети по тикеру (технические агенты
+RSI/SMA/волатильность + новости за 3 часа → LLM → JSON), построение модели
+pgmpy из JSON и её визуализация (граф, CPD, апостериорная вероятность).
+
 Построение графиков — в app/services/charting.py (чистая логика).
+Построение байесовских сетей — в app/services/bayesian_network_viz.py.
 """
 
 import os
@@ -19,6 +24,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -38,7 +44,7 @@ def _to_msk(dt) -> str:
 from app.core.config import settings
 from app.core.database import get_db_context
 from app.models.market import Instrument
-from app.models.news import RawNews
+from app.models.news import RawNews, NewsArticle
 from app.services.charting import (
     DARK_PALETTE,
     LIGHT_PALETTE,
@@ -58,6 +64,13 @@ from app.services.market_data import (
     upsert_instrument,
     build_client,
 )
+from app.services.news_aggregator import aggregate_news
+from app.services.bayesian_network import (
+    get_saved_networks,
+    run_bayesian_agent,
+    save_network_result,
+)
+from app.services import bayesian_network_viz as bnv
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +110,95 @@ def _news_for_ticker(db: Session, ticker: str, instrument_name: str = "",
         .limit(limit)
         .all()
     )
+
+
+def _processed_news_for_ticker(db: Session, ticker: str, instrument_name: str = "",
+                               limit: int = 15) -> list[NewsArticle]:
+    """
+    Обработанные новости (LLM) по тикеру с сентиментом.
+    Ищет по primary_ticker И по заголовку/тексту.
+    """
+    conditions = [
+        NewsArticle.primary_ticker.ilike(f"%{ticker}%"),
+        NewsArticle.title.ilike(f"%{ticker}%"),
+    ]
+    if instrument_name:
+        name_part = instrument_name.split()[0] if instrument_name else ""
+        if name_part and len(name_part) > 2:
+            conditions.append(NewsArticle.title.ilike(f"%{name_part}%"))
+            conditions.append(NewsArticle.summary.ilike(f"%{name_part}%"))
+    return (
+        db.query(NewsArticle)
+        .filter(or_(*conditions))
+        .order_by(
+            NewsArticle.published_at.is_(None),
+            NewsArticle.published_at.desc(),
+            NewsArticle.created_at.desc(),
+        )
+        .limit(limit)
+        .all()
+    )
+
+
+def _show_network(structure, ticker: str, chart_key: str = "network"):
+    """Отрисовывает сеть из JSON: граф (plotly), таблицы CPD, инференс, объяснение.
+
+    chart_key — уникальный суффикс для plotly_chart. _show_network может
+    вызываться на одном прогоне несколько раз (свежесгенерированная сеть +
+    выбранная из сохранённых), и одинаковые графики без key дают
+    Streamlit-ошибку «multiple plotly_chart elements».
+    """
+    if not structure:
+        st.warning("Структура сети пуста.")
+        return
+
+    try:
+        model, warnings = bnv.build_model_from_json(structure)
+    except ValueError as exc:
+        st.error(f"Не удалось собрать модель pgmpy: {exc}")
+        # Граф структуры показываем даже если модель не собралась
+        try:
+            st.plotly_chart(bnv.build_figure(structure, _PALETTE), width="stretch",
+                            key=f"bn_chart_{chart_key}_{ticker}")
+        except Exception:
+            st.caption("Граф не удалось построить.")
+        return
+    for w in warnings:
+        st.warning(w)
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        try:
+            fig = bnv.build_figure(structure, _PALETTE)
+            st.plotly_chart(fig, width="stretch",
+                            key=f"bn_chart_{chart_key}_{ticker}")
+        except Exception as exc:
+            st.error(f"Ошибка построения графа: {exc}")
+    with col2:
+        try:
+            target = structure.get("target_variable", "Price_Change")
+            _, probs = bnv.infer_target(model, target)
+            st.markdown(f"**Апостериорная вероятность `{target}`**")
+            for stt in ["Down", "Neutral", "Up"]:
+                val = probs.get(stt, 0.0)
+                emoji = "🔴" if stt == "Down" else ("🟢" if stt == "Up" else "⚪")
+                st.markdown(f"{emoji} **{stt}**: {val:.1%}")
+            action, best_state = bnv.action_from_probs(probs)
+            hint = " — нет чёткого перевеса" if best_state == "Neutral" else ""
+            st.caption(f"Действие по сети: **{action}**{hint}")
+        except Exception as exc:
+            st.caption(f"Инференс недоступен: {exc}")
+
+    st.markdown(f"**Объяснение:** {structure.get('explanation', '—')}")
+
+    with st.expander("Исходный JSON сети", expanded=False):
+        st.code(json.dumps(structure, ensure_ascii=False, indent=2),
+                language="json")
+
+    with st.expander("Таблицы CPD", expanded=False):
+        for var, df_cpd in bnv.cpd_tables(model):
+            st.markdown(f"**{var}**")
+            st.dataframe(df_cpd, width="stretch")
 
 
 # --- Данные для сайдбара ---
@@ -238,48 +340,199 @@ now_msk = datetime.now(MSK)
 st.sidebar.caption(f"Текущее время: {now_msk:%H:%M:%S} МСК")
 st.sidebar.caption("Фоновый сбор: каждые %d сек" % settings.COLLECT_INTERVAL_SECONDS)
 
-# --- Основная часть ---
+# --- Вкладки ---
 
-with get_db_context() as db:
-    rows = get_candles_from_db(db, ticker, timeframe, candle_count)
-    # Материализуем в DataFrame и плоские кортежи до закрытия сессии
-    df_raw = candles_to_df(rows)
-    df = add_indicators(df_raw) if not df_raw.empty else df_raw
-    # Имя инструмента для поиска новостей (напр. "РОСНЕФТЬ" для ROSN)
-    inst = db.get(Instrument, ticker)
-    inst_name = inst.name if inst else ""
-    news = [
-        (n.source or "?", n.published_at, n.title)
-        for n in _news_for_ticker(db, ticker, inst_name)
-    ]
+tab_market, tab_bayes = st.tabs(["📈 Рынок", "🕸️ Байесовские сети"])
 
-if df.empty:
-    st.info(
-        "Нет данных по этому тикеру/таймфрейму. "
-        "Нажмите «Обновить данные» в боковой панели."
+with tab_market:
+    with get_db_context() as db:
+        rows = get_candles_from_db(db, ticker, timeframe, candle_count)
+        # Материализуем в DataFrame и плоские кортежи до закрытия сессии
+        df_raw = candles_to_df(rows)
+        df = add_indicators(df_raw) if not df_raw.empty else df_raw
+        # Имя инструмента для поиска новостей (напр. "РОСНЕФТЬ" для ROSN)
+        inst = db.get(Instrument, ticker)
+        inst_name = inst.name if inst else ""
+        raw_news = [
+            (n.source or "?", n.published_at, n.title)
+            for n in _news_for_ticker(db, ticker, inst_name)
+        ]
+        news_agg = aggregate_news(db, ticker, hours=3)
+        processed_news = [
+            {
+                "source": n.source or "?",
+                "published_at": n.published_at,
+                "title": n.title,
+                "summary": n.summary or "",
+                "sentiment_score": n.sentiment_score,
+                "sentiment_label": n.sentiment_label or "neutral",
+                "tickers": n.tickers or "",
+                "tags": n.tags or "",
+            }
+            for n in _processed_news_for_ticker(db, ticker, inst_name)
+        ]
+
+    if df.empty:
+        st.info(
+            "Нет данных по этому тикеру/таймфрейму. "
+            "Нажмите «Обновить данные» в боковой панели."
+        )
+    else:
+        last_close = df["close"].iloc[-1]
+        first_open = df["open"].iloc[0]
+        period_change = (last_close - first_open) / first_open * 100 if first_open else 0.0
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Последняя цена", f"{last_close:,.2f} ₽",
+                    delta=f"{period_change:+.2f}% за период")
+        col2.metric("Максимум", f"{df['high'].max():,.2f} ₽")
+        col3.metric("Минимум", f"{df['low'].min():,.2f} ₽")
+        col4.metric("Суммарный объём", f"{df['volume'].sum():,.0f}")
+
+        fig = build_chart(df, ticker, TIMEFRAME_LABELS.get(timeframe, timeframe), _PALETTE)
+        st.plotly_chart(fig, width="stretch")
+
+        st.subheader(f"Новости по {ticker}")
+
+        if news_agg.total_news > 0:
+            if news_agg.avg_sentiment > 0.3:
+                agg_color = "#0ca30c"
+                agg_emoji = "🟢"
+            elif news_agg.avg_sentiment < -0.3:
+                agg_color = "#d03b3b"
+                agg_emoji = "🔴"
+            else:
+                agg_color = "#52514e"
+                agg_emoji = "⚪"
+
+            st.markdown(
+                f"**Агрегация за {news_agg.period_hours}ч:** "
+                f"{news_agg.total_news} новостей | "
+                f"Сентимент: <span style='color:{agg_color}'>{news_agg.avg_sentiment:+.2f}</span> | "
+                f"Достоверность: {news_agg.avg_confidence:.0%} | "
+                f"Позитив: {news_agg.positive_count} | "
+                f"Негатив: {news_agg.negative_count} | "
+                f"Нейтрально: {news_agg.neutral_count}",
+                unsafe_allow_html=True,
+            )
+            if news_agg.dominant_signal != "none":
+                signal_color = "#d03b3b" if news_agg.dominant_signal == "short" else "#0ca30c"
+                st.markdown(
+                    f":arrow_lower_right: **Сигнал: "
+                    f"<span style='color:{signal_color}'>{news_agg.dominant_signal.upper()}</span>** "
+                    f"(сила: {news_agg.signal_strength:.0%})",
+                    unsafe_allow_html=True,
+                )
+            st.divider()
+        else:
+            st.caption(f"Обработанных новостей за {news_agg.period_hours}ч нет.")
+
+        if processed_news:
+            st.markdown("**Обработанные новости (LLM):**")
+            for item in processed_news:
+                score = item["sentiment_score"]
+                when = _to_msk(item["published_at"])
+
+                if score is not None and score > 0.3:
+                    color = "#0ca30c"  # зелёный (позитив)
+                    emoji = "🟢"
+                elif score is not None and score < -0.3:
+                    color = "#d03b3b"  # красный (негатив)
+                    emoji = "🔴"
+                else:
+                    color = "#52514e"  # серый (нейтральный)
+                    emoji = "⚪"
+
+                score_str = f"{score:+.2f}" if score is not None else "—"
+                confidence_str = (f"({item['sentiment_score']:.0%})"
+                                  if item.get("sentiment_confidence") else "")
+
+                st.markdown(
+                    f":{emoji[0]}- <span style='color:{color}'>**[{item['source']}]** "
+                    f"({when} МСК) {item['title']} "
+                    f"[{score_str} {confidence_str}]</span>",
+                    unsafe_allow_html=True,
+                )
+                if item["summary"]:
+                    st.caption(f"  {item['summary'][:150]}...")
+        elif raw_news:
+            # Фолбэк: сырые новости (если LLM ещё не обработал)
+            st.caption("Обработанных новостей пока нет. Показываю сырые:")
+            for src, published_at, title in raw_news:
+                when = _to_msk(published_at)
+                st.markdown(f"- **[{src}]** ({when} МСК) {title}")
+        else:
+            st.caption("Новостей с этим тикером пока нет.")
+
+with tab_bayes:
+    st.subheader("🕸️ Байесовские сети (pgmpy)")
+    st.caption(
+        "Генерация сети: технические агенты (RSI/SMA/волатильность) + новости "
+        "за 3 часа → LLM → JSON → модель pgmpy."
     )
-    st.stop()
 
-# Метрики
-last_close = df["close"].iloc[-1]
-first_open = df["open"].iloc[0]
-period_change = (last_close - first_open) / first_open * 100 if first_open else 0.0
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Последняя цена", f"{last_close:,.2f} ₽",
-            delta=f"{period_change:+.2f}% за период")
-col2.metric("Максимум", f"{df['high'].max():,.2f} ₽")
-col3.metric("Минимум", f"{df['low'].min():,.2f} ₽")
-col4.metric("Суммарный объём", f"{df['volume'].sum():,.0f}")
+    bay_tickers = list(dict.fromkeys(list(known_tickers) + list(settings.TRACKED_TICKERS)))
+    bay_ticker = st.selectbox(
+        "Тикер",
+        bay_tickers,
+        key="bay_ticker",
+        accept_new_options=True,
+        placeholder="Выберите или введите тикер...",
+    ).strip().upper()
 
-# График
-fig = build_chart(df, ticker, TIMEFRAME_LABELS.get(timeframe, timeframe), _PALETTE)
-st.plotly_chart(fig, width="stretch")
+    if st.button("🚀 Сгенерировать сеть", type="primary", key="btn_gen_bayes"):
+        with st.spinner(f"Собираю данные и запрашиваю LLM для {bay_ticker}..."):
+            with get_db_context() as db:
+                result = run_bayesian_agent(db, bay_ticker)
+                saved_id = save_network_result(db, result) if result.get("valid") else None
 
-# Новости по тикеру
-st.subheader(f"Новости по {ticker}")
-if news:
-    for src, published_at, title in news:
-        when = _to_msk(published_at)
-        st.markdown(f"- **[{src}]** ({when} МСК) {title}")
-else:
-    st.caption("Новостей с этим тикером пока нет.")
+        if result.get("status") == "error":
+            st.error(f"Ошибка LLM: {result.get('error')}")
+        elif not result.get("valid"):
+            st.error("JSON не валиден:")
+            for e in result.get("errors", []):
+                st.error(f"  • {e}")
+        else:
+            st.success(f"✅ Сеть сгенерирована и сохранена (id={saved_id})")
+            for w in result.get("warnings", []):
+                st.warning(w)
+            _show_network(result.get("json"), bay_ticker, chart_key="generated")
+
+    st.divider()
+    st.markdown("**Сохранённые сети**")
+
+    view_all = st.checkbox(
+        "Показывать сети всех тикеров",
+        value=False,
+        key="bay_view_all",
+        help="По умолчанию — только сети выбранного выше тикера.",
+    )
+    # Материализуем строки в dict ДО закрытия сессии (иначе DetachedInstanceError
+    # при чтении атрибутов после выхода из with). Действие пересчитываем по
+    # сохранённым вероятностям (вдруг сохранено со старой логикой Up-vs-Down).
+    with get_db_context() as db:
+        saved = []
+        for d in get_saved_networks(
+            db, ticker=None if view_all else bay_ticker, limit=30
+        ):
+            action = d.action
+            infer = d.bayesian_inference_result or {}
+            probs = infer.get("probabilities") if isinstance(infer, dict) else None
+            if probs:
+                action, _ = bnv.action_from_probs(probs)
+            saved.append({
+                "label": (
+                    f"{d.created_at:%d.%m %H:%M} • {d.ticker} • {action} • "
+                    f"conf {d.confidence:.2f} • {d.bayesian_visualization or ''}"
+                ),
+                "ticker": d.ticker,
+                "structure": d.bayesian_network_structure,
+            })
+
+    if not saved:
+        scope = "всех тикеров" if view_all else f"«{bay_ticker}»"
+        st.caption(f"Сохранённых сетей {scope} нет. Сгенерируйте первую.")
+    else:
+        options = {row["label"]: row for row in saved}
+        sel_label = st.selectbox("Выбрать сохранённую сеть", list(options.keys()), key="bay_saved")
+        sel = options[sel_label]
+        _show_network(sel["structure"], sel["ticker"], chart_key="saved")

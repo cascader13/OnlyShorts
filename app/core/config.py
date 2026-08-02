@@ -75,6 +75,10 @@ class Settings:
     TAKE_PROFIT_PERCENT: float = float(os.getenv("TAKE_PROFIT_PERCENT", "5"))
     MAX_HOLD_HOURS: int = int(os.getenv("MAX_HOLD_HOURS", "4"))
 
+    # === Байесовская сеть ===
+    BAYESIAN_AGENT_ENABLED: bool = os.getenv("BAYESIAN_AGENT_ENABLED", "True").lower() == "true"
+    BAYESIAN_TIMEFRAME: str = os.getenv("BAYESIAN_TIMEFRAME", "1d")
+
     # === Пороги для сигналов ===
     SENTIMENT_THRESHOLD: float = float(os.getenv("SENTIMENT_THRESHOLD", "-0.4"))
     MIN_NEWS_COUNT: int = int(os.getenv("MIN_NEWS_COUNT", "3"))
