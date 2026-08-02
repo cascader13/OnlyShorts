@@ -71,6 +71,14 @@ from app.services.bayesian_network import (
     save_network_result,
 )
 from app.services import bayesian_network_viz as bnv
+from app.services.sandbox_account import (
+    get_accounts,
+    open_account,
+    pay_in,
+    get_positions,
+    get_portfolio,
+)
+from app.models.decision import Decision
 
 logger = logging.getLogger(__name__)
 
@@ -342,7 +350,9 @@ st.sidebar.caption("Фоновый сбор: каждые %d сек" % settings.
 
 # --- Вкладки ---
 
-tab_market, tab_bayes = st.tabs(["📈 Рынок", "🕸️ Байесовские сети"])
+tab_market, tab_bayes, tab_account = st.tabs(
+    ["📈 Рынок", "🕸️ Байесовские сети", "💰 Счёт и портфель"]
+)
 
 with tab_market:
     with get_db_context() as db:
@@ -536,3 +546,161 @@ with tab_bayes:
         sel_label = st.selectbox("Выбрать сохранённую сеть", list(options.keys()), key="bay_saved")
         sel = options[sel_label]
         _show_network(sel["structure"], sel["ticker"], chart_key="saved")
+
+
+with tab_account:
+    st.subheader("💰 Счёт и портфель (песочница T-Invest)")
+    st.caption(
+        "Баланс и пополнение — счёт песочницы. Справа — текущие позиции "
+        "(шорты выделяются) и прошедшие шорты со всеми деталями и ссылками "
+        "на байесовские сети."
+    )
+
+    # --- Аккаунт песочницы ---
+    try:
+        accounts = get_accounts()
+    except Exception as exc:
+        st.error(f"Не удалось получить аккаунты песочницы: {exc}")
+        accounts = []
+
+    if not accounts:
+        st.info("Аккаунт песочницы ещё не открыт.")
+        if st.button("🔓 Открыть аккаунт", type="primary", key="btn_open_sandbox"):
+            with st.spinner("Открываю аккаунт в песочнице..."):
+                try:
+                    open_account(name="PantsOnly")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Ошибка открытия аккаунта: {exc}")
+    else:
+        acc_options = {
+            f"{a['name']} ({a['account_id'][:8]}…)": a["account_id"] for a in accounts
+        }
+        sel_acc = st.selectbox("Аккаунт песочницы", list(acc_options.keys()))
+        account_id = acc_options[sel_acc]
+
+        # Портфель и позиции запрашиваем один раз (песочница нестабильна: 6
+        # ретраев на вызов), данные уже плоские dict — можно использовать ниже.
+        try:
+            pf = get_portfolio(account_id)
+            ps = get_positions(account_id)
+        except Exception as exc:
+            st.error(f"Ошибка получения портфеля: {exc}")
+            pf, ps = None, None
+
+        col_left, col_right = st.columns([1, 2])
+
+        with col_left:
+            st.markdown("**Баланс и пополнение**")
+            if pf:
+                total = pf["total_amount_portfolio"]
+                yield_total = pf["expected_yield"]
+                st.metric("Стоимость портфеля", f"{total:,.2f} ₽")
+                st.metric("Доходность", f"{yield_total:+,.2f} ₽")
+                if ps and ps["money"]:
+                    free = {m["currency"]: m["value"] for m in ps["money"]}
+                    st.caption("Доступно: " + ", ".join(
+                        f"{v:,.2f} {c.upper()}" for c, v in free.items()
+                    ))
+
+            st.divider()
+            st.markdown("**Пополнение**")
+            amount = st.number_input("Сумма пополнения, ₽",
+                                     min_value=0.0, value=100000.0, step=10000.0)
+            if st.button("💳 Пополнить", type="primary", key="btn_pay_in"):
+                with st.spinner("Пополняю счёт..."):
+                    try:
+                        res = pay_in(account_id, int(amount))
+                        st.success(f"Баланс после пополнения: {res['balance']:,.2f} {res['currency'].upper()}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Ошибка пополнения: {exc}")
+
+        with col_right:
+            st.markdown("**Портфель**")
+            positions = pf["positions"] if pf else []
+            if not positions:
+                st.caption("Открытых позиций нет.")
+            else:
+                for p in positions:
+                    qty = p["quantity"]
+                    is_short = qty < 0
+                    badge = "🔴 SHORT" if is_short else "🟢 LONG"
+                    avg = p["average_position_price"]
+                    cur = p["current_price"]
+                    yld = p["expected_yield"]
+                    st.markdown(
+                        f"**{p['ticker']}** {badge} "
+                        f"qty={abs(qty):g} avg={avg:,.2f} cur={cur:,.2f} "
+                        f"PnL={yld:+,.2f} ₽"
+                    )
+                    # Ссылка на байесовскую сеть по этому тикеру.
+                    # Материализуем поля в dict ДО закрытия сессии
+                    # (иначе DetachedInstanceError при чтении атрибутов).
+                    with get_db_context() as db:
+                        dec = (
+                            db.query(Decision)
+                            .filter(Decision.ticker == p["ticker"])
+                            .order_by(Decision.created_at.desc())
+                            .first()
+                        )
+                        if dec:
+                            dec_info = {
+                                "created_at": dec.created_at,
+                                "confidence": dec.confidence,
+                                "structure": dec.bayesian_network_structure,
+                            }
+                        else:
+                            dec_info = None
+                    if dec_info and dec_info["structure"]:
+                        with st.expander(
+                            f"🕸️ Байесовская сеть {p['ticker']} "
+                            f"({dec_info['created_at']:%d.%m %H:%M}, "
+                            f"conf {dec_info['confidence']:.2f})",
+                            expanded=False,
+                        ):
+                            _show_network(dec_info["structure"], p["ticker"],
+                                          chart_key=f"pos_{p['ticker']}")
+
+            st.divider()
+            st.markdown("**Прошедшие шорты**")
+            # Материализуем в dicts внутри сессии, поля читаются уже после неё
+            with get_db_context() as db:
+                past_shorts = [
+                    {
+                        "ticker": d.ticker,
+                        "created_at": d.created_at,
+                        "confidence": d.confidence,
+                        "probability_down": d.probability_down,
+                        "probability_up": d.probability_up,
+                        "structure": d.bayesian_network_structure,
+                        "id": d.id,
+                    }
+                    for d in (
+                        db.query(Decision)
+                        .filter(Decision.action == "SHORT")
+                        .order_by(Decision.created_at.desc())
+                        .limit(30)
+                        .all()
+                    )
+                ]
+            if not past_shorts:
+                st.caption("Прошедших шортов пока нет.")
+            else:
+                for d in past_shorts:
+                    pd = d["probability_down"]
+                    pu = d["probability_up"]
+                    pd_s = f"{pd:.2f}" if pd is not None else "—"
+                    pu_s = f"{pu:.2f}" if pu is not None else "—"
+                    st.markdown(
+                        f"**{d['ticker']}** • {d['created_at']:%d.%m %H:%M} МСК • "
+                        f"conf={d['confidence']:.2f} • P(down)={pd_s} "
+                        f"P(up)={pu_s}"
+                    )
+                    if d["structure"]:
+                        with st.expander(
+                            f"🕸️ Сеть {d['ticker']} ({d['created_at']:%d.%m %H:%M})",
+                            expanded=False,
+                        ):
+                            _show_network(d["structure"], d["ticker"],
+                                          chart_key=f"past_{d['ticker']}_{d['id']}")
