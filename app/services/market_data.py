@@ -85,14 +85,20 @@ def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
 # --- Подключение ---
 
 def build_client() -> Client:
-    """Создаёт синхронный Client к T-Invest (песочница)."""
+    """Создаёт синхронный Client к T-Invest (песочница или боевой режим).
+
+    Адрес выбирается по settings.TINKOFF_SANDBOX: True — песочница,
+    False — боевой API. Токен всегда берётся из settings.TINKOFF_TOKEN.
+    """
     # Страховка: флаг уже выставляется в config.py при импорте, но канал
     # создаётся в Client.__init__, поэтому дублируем setdefault.
     os.environ.setdefault("SSL_TBANK_VERIFY", "true")
-    return Client(
-        settings.TINKOFF_TOKEN,
-        target=settings.TINKOFF_SANDBOX_ADDRESS,
+    target = (
+        settings.TINKOFF_SANDBOX_ADDRESS
+        if settings.TINKOFF_SANDBOX
+        else settings.TINKOFF_LIVE_ADDRESS
     )
+    return Client(settings.TINKOFF_TOKEN, target=target)
 
 
 # --- Инструменты ---

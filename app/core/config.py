@@ -43,6 +43,7 @@ class Settings:
     )
     TINKOFF_SANDBOX: bool = os.getenv("TINKOFF_SANDBOX", "True").lower() == "true"
     TINKOFF_SANDBOX_ADDRESS: str = "sandbox-invest-public-api.tbank.ru:443"
+    TINKOFF_LIVE_ADDRESS: str = "invest-public-api.tbank.ru:443"
 
     # gRPC-канал t_tech.invest читает SSL_TBANK_VERIFY в create_channel
     # (см. t_tech/invest/channels.py). Без "true" подключение падает с
