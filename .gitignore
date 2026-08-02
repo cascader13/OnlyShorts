@@ -1,0 +1,36 @@
+# === Секреты и ключи ===
+.env
+.env.*
+*.key
+*.pem
+*.p12
+secrets*
+credentials*
+
+# === Виртуальное окружение ===
+.venv/
+venv/
+
+# === Базы данных ===
+data/*.db
+data/*.db-*
+
+# === Кэш Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# === IDE ===
+.idea/
+.claude/
+
+# === Логи ===
+*.log
+
+# === Streamlit ===
+.streamlit/
+
+# === Временные файлы ===
+_chart_*.png
+*.tmp

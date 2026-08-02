@@ -1,0 +1,22 @@
+# --- Веб-фреймворк и API ---
+fastapi==0.141.1
+uvicorn==0.52.0
+pydantic==2.13.4
+
+# --- База данных ---
+SQLAlchemy==2.0.51
+python-dotenv==1.2.2
+
+# --- Сбор данных ---
+requests==2.34.2
+feedparser==6.0.14
+
+# --- T-Bank Invest SDK (песочница/реальный) ---
+t-tech-investments==1.49.2
+grpcio==1.83.0
+protobuf==6.33.6
+
+# --- Дашборд / графики ---
+streamlit==1.60.0
+plotly==6.9.0
+pandas==3.0.5
