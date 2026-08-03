@@ -5,13 +5,13 @@
 Используется для принятия торговых решений и отображения на дашборде.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 
-from app.models.news import NewsArticle
+from app.core.timeutil import msk_now
+from app.models.news import NewsArticle, ticker_matches
 
 
 @dataclass
@@ -43,21 +43,27 @@ def aggregate_news(db: Session, ticker: str, hours: int = 3) -> NewsAggregation:
     Returns:
         NewsAggregation с результатами
     """
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since = msk_now() - timedelta(hours=hours)
 
-    # Ищем по primary_ticker и по заголовку
+    # Ищем по тикеру (primary или CSV-список tickers) и по заголовку.
+    # Окно — по ВРЕМЕНИ ПУБЛИКАЦИИ (published_at), а не обработки LLM:
+    # задержка анализа не должна «сдвигать» новость в более свежий сигнал
+    # (тот же принцип, что в атрибуции снапшотов training_data). Статьи без
+    # published_at не учитываем — приписать их к окну нельзя.
     from sqlalchemy import or_
     articles = (
         db.query(NewsArticle)
         .filter(
             or_(
-                NewsArticle.primary_ticker.ilike(f"%{ticker}%"),
+                ticker_matches(NewsArticle.primary_ticker, ticker),
+                ticker_matches(NewsArticle.tickers, ticker),
                 NewsArticle.title.ilike(f"%{ticker}%"),
             ),
-            NewsArticle.created_at >= since.replace(tzinfo=None),
+            NewsArticle.published_at.isnot(None),
+            NewsArticle.published_at >= since.replace(tzinfo=None),
             NewsArticle.sentiment_score.isnot(None),
         )
-        .order_by(NewsArticle.created_at.desc())
+        .order_by(NewsArticle.published_at.desc())
         .all()
     )
 
@@ -135,7 +141,7 @@ def aggregate_news(db: Session, ticker: str, hours: int = 3) -> NewsAggregation:
 
 def get_news_sentiment_for_agent(db: Session, ticker: str, hours: int = 3) -> dict:
     """
-    Возвращает агрегацию новостей в формате dict для агентов/байевской сети.
+    Возвращает агрегацию новостей в формате dict для торгового агента.
 
     Returns:
         dict: {

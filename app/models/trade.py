@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import TYPE_CHECKING, Optional
 
 from app.core.database import Base
+from app.core.timeutil import msk_now
 
 if TYPE_CHECKING:
     from app.models.decision import Decision
@@ -54,8 +55,8 @@ class Trade(Base):
     highest_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     lowest_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-    opened_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=msk_now, comment="naive МСК")
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="naive МСК")
     duration_hours: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     broker_order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
@@ -84,14 +85,16 @@ class Trade(Base):
         self.exit_price = exit_price
         self.exit_value = exit_price * self.quantity
         self.exit_commission = commission
-        self.closed_at = datetime.utcnow()
+        self.closed_at = msk_now()
         self.status = "CLOSED"
         self.duration_hours = (self.closed_at - self.opened_at).total_seconds() / 3600
 
+        # total_fees может быть None (nullable, без default) — трактуем как 0
+        fees = self.total_fees or 0.0
         if self.direction == "SHORT":
-            self.pnl = (self.entry_price - exit_price) * self.quantity - self.total_fees
+            self.pnl = (self.entry_price - exit_price) * self.quantity - fees
         else:
-            self.pnl = (exit_price - self.entry_price) * self.quantity - self.total_fees
+            self.pnl = (exit_price - self.entry_price) * self.quantity - fees
 
         self.pnl_percent = (self.pnl / self.entry_value) * 100 if self.entry_value else 0
         self.is_profitable = self.pnl > 0 if self.pnl is not None else False

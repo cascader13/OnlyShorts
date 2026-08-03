@@ -61,6 +61,7 @@ def ask_llm(
     model: Optional[str] = None,
     temperature: float = 0.3,
     max_tokens: int = 1024,
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     """
     Отправляет запрос к LLM и возвращает текст ответа.
@@ -95,6 +96,11 @@ def ask_llm(
     }
     if model:
         payload["model"] = model
+    # Хинт для reasoning-моделей (DeepSeek и т.п.): без него модель тратит
+    # весь max_tokens на reasoning_content и возвращает пустой content.
+    # Модели/шлюзы без поддержки параметр игнорируют.
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
 
     display_model = model or "(модель шлюза по умолчанию)"
     logger.info("LLM запрос: %s, модель=%s, длина промпта=%d", url, display_model, len(prompt))

@@ -26,10 +26,12 @@ MSK = timezone(timedelta(hours=3))
 
 
 def _to_msk_iso(dt) -> str | None:
-    """Конвертирует naive UTC datetime в ISO строку МСК."""
+    """Форматирует naive МСК datetime в ISO строку (без конвертации)."""
     if dt is None:
         return None
-    return dt.replace(tzinfo=timezone.utc).astimezone(MSK).isoformat()
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(MSK).replace(tzinfo=None)
+    return dt.isoformat()
 
 logger = logging.getLogger(__name__)
 

@@ -192,9 +192,88 @@ def _migrate_database():
         conn.execute("ALTER TABLE news_articles ADD COLUMN raw_news_id INTEGER")
         print("  [миграция] Добавлена колонка news_articles.raw_news_id")
 
+    # Добавляем volume в training_snapshots если нет
+    try:
+        snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(training_snapshots)").fetchall()}
+        if "volume" not in snap_cols:
+            conn.execute("ALTER TABLE training_snapshots ADD COLUMN volume REAL")
+            print("  [миграция] Добавлена колонка training_snapshots.volume")
+    except Exception:
+        pass  # таблица ещё не создана — init_database создаст её с volume
+
+    # Path-симуляция меток (вариант A): колонки результата симуляции выхода.
+    # Старые строки получают NULL и переразмечаются через --relabel.
+    try:
+        snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(training_snapshots)").fetchall()}
+        sim_columns = {
+            "exit_reason": "VARCHAR(20)",
+            "sim_exit_price": "REAL",
+            "sim_duration_hours": "REAL",
+            "mae_pct": "REAL",
+            "mfe_pct": "REAL",
+            "max_hold_hours": "REAL",
+            "label_stop_loss_pct": "REAL",
+            "label_take_profit_pct": "REAL",
+            "label_trail_activation_pct": "REAL",
+            "label_trail_distance_pct": "REAL",
+            "label_version": "VARCHAR(40)",
+        }
+        for col, sql_type in sim_columns.items():
+            if col not in snap_cols:
+                conn.execute(f"ALTER TABLE training_snapshots ADD COLUMN {col} {sql_type}")
+                print(f"  [миграция] Добавлена колонка training_snapshots.{col}")
+    except Exception:
+        pass  # таблица ещё не создана — init_database создаст её с колонками
+
+    # Одноразовая миграция: naive UTC -> naive МСК (+3ч) в существующих данных.
+    _migrate_timezone_to_msk(conn)
+
     conn.execute("PRAGMA foreign_keys = ON")
     conn.commit()
     conn.close()
+
+
+def _migrate_timezone_to_msk(conn):
+    """Одноразовая миграция: сдвиг существующих naive UTC-времён на +3ч (МСК).
+
+    Сдвигаем ТОЛЬКО сгенерированные сервисами метки времени (created_at,
+    updated_at, ts свечей, timestamp снапшотов и т.п.) — они гарантированно
+    писались в UTC (datetime.utcnow / конвертация из SDK). published_at НЕ
+    трогаем: источники отдают его в разных таймзонах (Пульс/МОЕХ — уже МСК,
+    RSS — UTC), единый сдвиг испортил бы верные значения.
+
+    Контроль запуска — PRAGMA user_version: 0 -> выполняем сдвиг и ставим 1,
+    дальше пропускаем. На новой пустой БД сдвиг — no-op (строк нет).
+    """
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version >= 1:
+        return
+
+    shift = {
+        "candles": ["ts", "created_at"],
+        "training_snapshots": ["timestamp", "labeled_at", "created_at"],
+        "trades": ["opened_at", "closed_at"],
+        "decisions": ["created_at", "evaluated_at"],
+        "instruments": ["updated_at", "first_1day_candle_date"],
+        "raw_news": ["created_at"],
+        "news_articles": ["created_at"],
+    }
+    shifted = 0
+    for table, columns in shift.items():
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for col in columns:
+            if col in existing:
+                cur = conn.execute(
+                    f"UPDATE {table} SET {col} = datetime({col}, '+3 hours') "
+                    f"WHERE {col} IS NOT NULL"
+                )
+                shifted += cur.rowcount
+
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    print(f"  [миграция] Времена сдвинуты в МСК (+3ч): {shifted} значений")
 
 
 def drop_database():

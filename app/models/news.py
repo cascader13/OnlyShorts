@@ -1,9 +1,26 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import String, DateTime, Text, Boolean, Float, Integer, ColumnElement
+from sqlalchemy import String, DateTime, Text, Boolean, Float, Integer, ColumnElement, or_
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
+from app.core.timeutil import msk_now
+
+
+def ticker_matches(column, ticker: str) -> ColumnElement[bool]:
+    """
+    SQL-условие точного совпадения тикера в колонке.
+
+    Колонка хранит либо один тикер (primary_ticker), либо CSV-список без
+    пробелов (tickers = "SBER,GAZP"). Ищем ровно заданный тикер, а не
+    подстроку: ilike("%SBER%") ошибочно матчит "SBERP", "GLDRUB_TOM" и т.п.
+    """
+    return or_(
+        column == ticker,
+        column.like(f"{ticker},%"),
+        column.like(f"%,{ticker}"),
+        column.like(f"%,{ticker},%"),
+    )
 
 
 class RawNews(Base):
@@ -39,7 +56,7 @@ class RawNews(Base):
     hash_content: Mapped[str] = mapped_column(String(64), nullable=True,
                                               comment="Хеш текста для быстрого поиска дублей")
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, comment="Время сохранения в БД")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=msk_now, comment="Время сохранения в БД (naive МСК)")
 
     def __repr__(self) -> str:
         return f"<RawNews(id={self.id}, source='{self.source}', title='{self.title[:50]}...')>"
@@ -87,7 +104,7 @@ class NewsArticle(Base):
     # Ссылка на исходную новость (для просмотра оригинала)
     raw_news_id: Mapped[int] = mapped_column(Integer, nullable=True, comment="ID исходной новости в raw_news")
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, comment="Время сохранения")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=msk_now, comment="Время сохранения (naive МСК)")
 
     def __repr__(self) -> str:
         return f"<NewsArticle(id={self.id}, ticker='{self.primary_ticker}', sentiment={self.sentiment_score:.2f})>"

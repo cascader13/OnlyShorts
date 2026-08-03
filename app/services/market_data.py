@@ -5,8 +5,9 @@
 в таблицу candles (ключ ticker+timeframe+ts) и кэш метаданных инструментов.
 
 Ключевые решения:
-- Время храним как naive UTC (SQLite хранит DateTime без offset);
-  на вход SDK отдаём timezone-aware UTC (иначе TypeError в get_intervals).
+- Время храним как naive МСК (UTC+3, конвенция проекта); на вход SDK
+  отдаём timezone-aware (иначе TypeError в get_intervals) — для границ
+  окна прикрепляем MSK к naive-значениям из БД.
 - Инкрементальный сбор: при наличии свечей в БД запрашиваем от
   (последний ts - 2 периода) — перекрытие позволяет перезаписать
   незавершённую свечу (is_complete=False) и её поздние правки.
@@ -16,7 +17,7 @@
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -26,6 +27,7 @@ from t_tech.invest import Client, CandleInterval, InstrumentIdType
 from t_tech.invest.utils import get_intervals
 
 from app.core.config import settings
+from app.core.timeutil import MSK, msk_now, to_naive_msk
 from app.models.market import Candle, Instrument
 
 logger = logging.getLogger(__name__)
@@ -63,23 +65,9 @@ INSTRUMENT_CACHE_TTL = timedelta(hours=24)
 API_CALL_DELAY = 0.05
 
 
-def _utcnow() -> datetime:
-    """Наивное UTC-время."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
 def _quotation_to_float(q) -> float:
     """Quotation(units, nano) -> float. Nano может быть отрицательным (-5e8)."""
     return float(q.units) + float(q.nano) / 1e9
-
-
-def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """Переводит timezone-aware datetime в naive UTC; naive оставляет как есть."""
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 # --- Подключение ---
@@ -114,7 +102,7 @@ def _instrument_obj_to_dict(ticker: str, inst) -> dict:
         "class_code": inst.class_code or DEFAULT_CLASS_CODE,
         "instrument_type": inst.instrument_type or None,
         "uid": inst.uid or None,
-        "first_1day_candle_date": _to_naive_utc(inst.first_1day_candle_date),
+        "first_1day_candle_date": to_naive_msk(inst.first_1day_candle_date),
     }
 
 
@@ -129,7 +117,7 @@ def _instrument_short_to_dict(ticker: str, item) -> dict:
         "class_code": item.class_code or DEFAULT_CLASS_CODE,
         "instrument_type": None,
         "uid": item.uid or None,
-        "first_1day_candle_date": _to_naive_utc(item.first_1day_candle_date),
+        "first_1day_candle_date": to_naive_msk(item.first_1day_candle_date),
     }
 
 
@@ -156,7 +144,7 @@ def resolve_instrument(client, db: Session, ticker: str) -> dict:
     find_instrument(query) -> устаревший кэш -> ошибка.
     """
     cached = db.get(Instrument, ticker)
-    if cached is not None and _utcnow() - cached.updated_at < INSTRUMENT_CACHE_TTL:
+    if cached is not None and msk_now() - cached.updated_at < INSTRUMENT_CACHE_TTL:
         return _instrument_to_dict(cached)
 
     data = None
@@ -207,7 +195,7 @@ def upsert_instrument(db: Session, ticker: str, data: dict) -> None:
     inst.instrument_type = data.get("instrument_type")
     inst.uid = data.get("uid")
     inst.first_1day_candle_date = data.get("first_1day_candle_date")
-    inst.updated_at = _utcnow()
+    inst.updated_at = msk_now()
     db.commit()
 
 
@@ -222,9 +210,9 @@ def delete_instrument(db: Session, ticker: str) -> None:
 # --- Свечи ---
 
 def _to_candle_dict(c) -> dict:
-    """HistoricCandle -> dict с naive UTC ts."""
+    """HistoricCandle -> dict с naive МСК ts."""
     return {
-        "ts": _to_naive_utc(c.time),
+        "ts": to_naive_msk(c.time),
         "open": _quotation_to_float(c.open),
         "high": _quotation_to_float(c.high),
         "low": _quotation_to_float(c.low),
@@ -238,7 +226,7 @@ def fetch_candles(client, figi: str, timeframe: str,
                   from_: datetime, to: datetime) -> list[dict]:
     """
     Загружает свечи из API, разбивая диапазон по лимитам SDK (get_intervals).
-    from_/to должны быть timezone-aware UTC. Возвращает список dict.
+    from_/to должны быть timezone-aware. Возвращает список dict.
     """
     interval = TIMEFRAME_ENUMS[timeframe]
     out: list[dict] = []
@@ -260,6 +248,35 @@ def fetch_candles(client, figi: str, timeframe: str,
             out.append(_to_candle_dict(c))
         time.sleep(API_CALL_DELAY)
     return out
+
+
+def get_last_price(figi: str, *, retries: int = 5, base_delay: float = 1.0) -> Optional[float]:
+    """Текущая цена инструмента (LastPrice) из T-Invest.
+
+    Используется мониторингом позиций: дешевле и свежее, чем тянуть свечи.
+    Возвращает None, если цена недоступна (нет торгов / API отвечает ошибкой
+    после всех ретраев) — вызывающий код сам решает, как поступить.
+    """
+    def _call() -> Optional[float]:
+        with build_client() as sdk:
+            resp = sdk.market_data.get_last_prices(figi=[figi])
+        for item in resp.last_prices:
+            if item.figi == figi:
+                return _quotation_to_float(item.price)
+        return None
+
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return _call()
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "get_last_price retry %d/%d (%s): %s", attempt + 1, retries, figi, exc,
+            )
+            time.sleep(base_delay + attempt * 0.5)
+    logger.warning("get_last_price: не удалось получить цену %s (%s)", figi, last_error)
+    return None
 
 
 def upsert_candles(db: Session, ticker: str, figi: str, timeframe: str,
@@ -323,7 +340,7 @@ def upsert_candles(db: Session, ticker: str, figi: str, timeframe: str,
 
 
 def get_last_ts(db: Session, ticker: str, timeframe: str) -> Optional[datetime]:
-    """Последний ts свечи в БД (naive UTC) или None."""
+    """Последний ts свечи в БД (naive МСК) или None."""
     return db.query(func.max(Candle.ts)).filter(
         Candle.ticker == ticker,
         Candle.timeframe == timeframe,
@@ -334,15 +351,14 @@ def _collect_timeframe(db: Session, client, ticker: str, figi: str,
                        timeframe: str) -> int:
     """Инкрементальный сбор одного тикера и таймфрейма."""
     last_ts = get_last_ts(db, ticker, timeframe)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(MSK)
 
     if last_ts is None:
         from_ = now - HISTORY_DEPTH[timeframe]
     else:
-        # Перекрытие в 2 периода: перезапишем незавершённую и правки свечи
-        from_ = last_ts - 2 * INTERVAL_DURATION[timeframe]
-        if from_.tzinfo is None:
-            from_ = from_.replace(tzinfo=timezone.utc)
+        # Перекрытие в 2 периода: перезапишем незавершённую и правки свечи.
+        # last_ts — naive МСК, прикрепляем MSK, чтобы SDK получил aware.
+        from_ = (last_ts - 2 * INTERVAL_DURATION[timeframe]).replace(tzinfo=MSK)
 
     candles = fetch_candles(client, figi, timeframe, from_, now)
     return upsert_candles(db, ticker, figi, timeframe, candles)

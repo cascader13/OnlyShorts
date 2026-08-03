@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from sqlalchemy import String, DateTime, Float, Integer, JSON, Text, ForeignKey, Index
+from sqlalchemy import String, DateTime, Float, Integer, Text, ForeignKey, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import TYPE_CHECKING, Optional
 
 from app.core.database import Base
+from app.core.timeutil import msk_now
 
 if TYPE_CHECKING:
     from app.models.trade import Trade
@@ -24,8 +25,6 @@ class Decision(Base):
     quantity: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     confidence: Mapped[float] = mapped_column(Float)
-    probability_down: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    probability_up: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     sentiment_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     sentiment_news_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -35,15 +34,8 @@ class Decision(Base):
     sma_50: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     sma_200: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-    bayesian_network_structure: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-    bayesian_network_cpds: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-    bayesian_inference_result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
-    bayesian_visualization: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
     llm_prompt_sentiment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     llm_response_sentiment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    llm_prompt_network: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    llm_response_network: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     llm_prompt_explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     llm_response_explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -60,7 +52,7 @@ class Decision(Base):
         viewonly=True,
     )
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=msk_now, index=True, comment="naive МСК")
     evaluated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (

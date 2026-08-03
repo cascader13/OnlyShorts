@@ -4,9 +4,9 @@ Please process the news data as follows:
 
 - **Title**: Extract and condense the core headline of each news item, ensuring it captures the essential information.
 - **summary**: Provide a concise summary of the news content, retaining key details while avoiding redundancy.
-- **sentiment_score**: Provide a digit score of sentiment of news from -1(negative) to 1(positive)
+- **sentiment_score**: Provide a digit score from -1.0 (strongly negative) to 1.0 (strongly positive) reflecting the expected IMPACT of the news on the company's stock price over the next 1-2 trading days — not just the tone of the text. Neutral news with no clear price impact should be close to 0.0.
 - **sentiment_confidence**: Give rate of your confidence in previously score: 0(i am not sure) to 1(i am exactly confident)
-- **tickers**: group of tickers(from main ticker to less significant ticker in news) mentioned in news or affected by news
+- **tickers**: array of real MOEX ticker codes (e.g. SBER, GAZP, YNDX) mentioned in or affected by the news, ordered from the most significant to the least significant. Use ONLY ticker codes present in the text or in {$TICKER} tags. Never invent tickers, and never include bond ISINs (RU000A10FA72), futures/derivatives codes (BRQ6, MMU6), index codes (IMOEX, IMOEXF) or foreign tickers (T, YDEX, HEAD).
 - **Industry Tag**: Categorize each news item into one of the following predefined sectors:
   - IT
   - Metals & Mining
@@ -21,15 +21,18 @@ Please process the news data as follows:
 
 - **Deduplication**: Compare incoming news items for similarity. If multiple entries cover the same event, merge them into a single, comprehensive entry with the most accurate title and description.
 
+- **news_index**: For every output entry, return the 1-based index [N] of the original news item it corresponds to (the input items are labeled [1], [2], ...). If several input items describe the same event and you merged them, set news_index to the SMALLEST of their indices. Never invent indices — use only the values [1..N] from the input. Output entries must be in ascending news_index order.
+
 - **Output Format**: Deliver the processed data in a structured JSON format with the following schema and respond only in russian:
   ```json
   {
     "title": "string",
     "summary": "string",
-    "sentiment_score": "float",
-    "sentiment_confidence": "float",
-    "tickers": {"ticker": "string"}
-    "industry_tag": "string"
+    "sentiment_score": 0.0,
+    "sentiment_confidence": 0.0,
+    "tickers": ["SBER", "GAZP"],
+    "industry_tag": "string",
+    "news_index": 1
   }
   ```
 

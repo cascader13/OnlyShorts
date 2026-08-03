@@ -17,6 +17,7 @@ import feedparser
 
 from app.collectors.base import BaseCollector
 from app.core.config import settings
+from app.core.timeutil import naive_utc_to_msk, to_naive_msk
 
 logger = logging.getLogger(__name__)
 
@@ -113,15 +114,20 @@ class RBCCollector(BaseCollector):
 
     @staticmethod
     def _parse_published(entry) -> datetime:
-        """Разбирает время публикации из RSS (struct_time или строка)."""
+        """Разбирает время публикации из RSS и нормализует в naive МСК.
+
+        feedparser отдаёт `published_parsed` как struct_time в UTC — сдвигаем
+        в МСК (naive_utc_to_msk). Строковый фолбэк (RFC822/ISO) приводим
+        к МСК через to_naive_msk.
+        """
         parsed = entry.get("published_parsed") or entry.get("updated_parsed")
         if parsed and isinstance(parsed, struct_time):
-            return datetime(*parsed[:6])
+            return naive_utc_to_msk(datetime(*parsed[:6]))
         published = entry.get("published") or entry.get("updated") or ""
         if published:
             try:
-                return datetime.fromisoformat(
-                    published.replace("Z", "+00:00")
+                return to_naive_msk(
+                    datetime.fromisoformat(published.replace("Z", "+00:00"))
                 )
             except ValueError:
                 return None

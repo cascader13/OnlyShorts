@@ -8,12 +8,7 @@ Streamlit-дашборд рыночных данных.
 лента последних новостей по тикеру из raw_news. Кнопка «Обновить данные»
 вызывает разовый сбор свечей через T-Invest SDK.
 
-Вкладка «Байесовские сети»: генерация сети по тикеру (технические агенты
-RSI/SMA/волатильность + новости за 3 часа → LLM → JSON), построение модели
-pgmpy из JSON и её визуализация (граф, CPD, апостериорная вероятность).
-
 Построение графиков — в app/services/charting.py (чистая логика).
-Построение байесовских сетей — в app/services/bayesian_network_viz.py.
 """
 
 import os
@@ -24,7 +19,6 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-import json
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -36,15 +30,21 @@ MSK = timezone(timedelta(hours=3))  # Московское время
 
 
 def _to_msk(dt) -> str:
-    """Конвертирует naive UTC datetime в строку МСК."""
+    """Форматирует naive МСК datetime в строку МСК (без конвертации).
+
+    БД хранит время уже в МСК. На случай случайного timezone-aware значения
+    (например, из API) — приводим к МСК.
+    """
     if dt is None:
         return "—"
-    return dt.replace(tzinfo=timezone.utc).astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(MSK).replace(tzinfo=None)
+    return dt.strftime("%d.%m.%Y %H:%M")
 
 from app.core.config import settings
 from app.core.database import get_db_context
 from app.models.market import Instrument
-from app.models.news import RawNews, NewsArticle
+from app.models.news import RawNews, NewsArticle, ticker_matches
 from app.services.charting import (
     DARK_PALETTE,
     LIGHT_PALETTE,
@@ -65,12 +65,6 @@ from app.services.market_data import (
     build_client,
 )
 from app.services.news_aggregator import aggregate_news
-from app.services.bayesian_network import (
-    get_saved_networks,
-    run_bayesian_agent,
-    save_network_result,
-)
-from app.services import bayesian_network_viz as bnv
 from app.services.sandbox_account import (
     get_accounts,
     open_account,
@@ -123,11 +117,12 @@ def _news_for_ticker(db: Session, ticker: str, instrument_name: str = "",
 def _processed_news_for_ticker(db: Session, ticker: str, instrument_name: str = "",
                                limit: int = 15) -> list[NewsArticle]:
     """
-    Обработанные новости (LLM) по тикеру с сентиментом.
-    Ищет по primary_ticker И по заголовку/тексту.
+    Обработанные новости по тикеру с сентиментом.
+    Ищет по тикеру (primary или CSV-список tickers) и по заголовку/тексту.
     """
     conditions = [
-        NewsArticle.primary_ticker.ilike(f"%{ticker}%"),
+        ticker_matches(NewsArticle.primary_ticker, ticker),
+        ticker_matches(NewsArticle.tickers, ticker),
         NewsArticle.title.ilike(f"%{ticker}%"),
     ]
     if instrument_name:
@@ -148,78 +143,22 @@ def _processed_news_for_ticker(db: Session, ticker: str, instrument_name: str = 
     )
 
 
-def _show_network(structure, ticker: str, chart_key: str = "network"):
-    """Отрисовывает сеть из JSON: граф (plotly), таблицы CPD, инференс, объяснение.
-
-    chart_key — уникальный суффикс для plotly_chart. _show_network может
-    вызываться на одном прогоне несколько раз (свежесгенерированная сеть +
-    выбранная из сохранённых), и одинаковые графики без key дают
-    Streamlit-ошибку «multiple plotly_chart elements».
-    """
-    if not structure:
-        st.warning("Структура сети пуста.")
-        return
-
-    try:
-        model, warnings = bnv.build_model_from_json(structure)
-    except ValueError as exc:
-        st.error(f"Не удалось собрать модель pgmpy: {exc}")
-        # Граф структуры показываем даже если модель не собралась
-        try:
-            st.plotly_chart(bnv.build_figure(structure, _PALETTE), width="stretch",
-                            key=f"bn_chart_{chart_key}_{ticker}")
-        except Exception:
-            st.caption("Граф не удалось построить.")
-        return
-    for w in warnings:
-        st.warning(w)
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        try:
-            fig = bnv.build_figure(structure, _PALETTE)
-            st.plotly_chart(fig, width="stretch",
-                            key=f"bn_chart_{chart_key}_{ticker}")
-        except Exception as exc:
-            st.error(f"Ошибка построения графа: {exc}")
-    with col2:
-        try:
-            target = structure.get("target_variable", "Price_Change")
-            _, probs = bnv.infer_target(model, target)
-            st.markdown(f"**Апостериорная вероятность `{target}`**")
-            for stt in ["Down", "Neutral", "Up"]:
-                val = probs.get(stt, 0.0)
-                emoji = "🔴" if stt == "Down" else ("🟢" if stt == "Up" else "⚪")
-                st.markdown(f"{emoji} **{stt}**: {val:.1%}")
-            action, best_state = bnv.action_from_probs(probs)
-            hint = " — нет чёткого перевеса" if best_state == "Neutral" else ""
-            st.caption(f"Действие по сети: **{action}**{hint}")
-        except Exception as exc:
-            st.caption(f"Инференс недоступен: {exc}")
-
-    st.markdown(f"**Объяснение:** {structure.get('explanation', '—')}")
-
-    with st.expander("Исходный JSON сети", expanded=False):
-        st.code(json.dumps(structure, ensure_ascii=False, indent=2),
-                language="json")
-
-    with st.expander("Таблицы CPD", expanded=False):
-        for var, df_cpd in bnv.cpd_tables(model):
-            st.markdown(f"**{var}**")
-            st.dataframe(df_cpd, width="stretch")
-
-
 # --- Данные для сайдбара ---
 
 with get_db_context() as db:
     instruments = get_instruments(db)
     # Материализуем строки внутри сессии (иначе DetachedInstanceError)
+    known_tickers = {i.ticker for i in instruments}
+    # Выпадашка = кэш instruments + все тикеры из TRACKED_TICKERS (даже те, что
+    # ещё не зарезолвлены в песочнице). Отслеживаемые тикеры видны всегда и
+    # дорезолвятся автоматически при выборе (код ниже). Не дублируем уже
+    # закешированные (идут с названием из instruments).
     instrument_options = (
         [f"{i.ticker} — {i.name}" for i in instruments]
-        if instruments
-        else list(settings.TRACKED_TICKERS)
+        + [t for t in settings.TRACKED_TICKERS if t not in known_tickers]
     )
-    known_tickers = {i.ticker for i in instruments}
+    if not instrument_options:
+        instrument_options = list(settings.TRACKED_TICKERS)
     last_update = get_last_update_time(db)
 
 known_tfs = [tf for tf in settings.MARKET_TIMEFRAMES if tf in TIMEFRAME_LABELS]
@@ -350,8 +289,8 @@ st.sidebar.caption("Фоновый сбор: каждые %d сек" % settings.
 
 # --- Вкладки ---
 
-tab_market, tab_bayes, tab_account = st.tabs(
-    ["📈 Рынок", "🕸️ Байесовские сети", "💰 Счёт и портфель"]
+tab_market, tab_account = st.tabs(
+    ["📈 Рынок", "💰 Счёт и портфель"]
 )
 
 with tab_market:
@@ -473,87 +412,11 @@ with tab_market:
         else:
             st.caption("Новостей с этим тикером пока нет.")
 
-with tab_bayes:
-    st.subheader("🕸️ Байесовские сети (pgmpy)")
-    st.caption(
-        "Генерация сети: технические агенты (RSI/SMA/волатильность) + новости "
-        "за 3 часа → LLM → JSON → модель pgmpy."
-    )
-
-    bay_tickers = list(dict.fromkeys(list(known_tickers) + list(settings.TRACKED_TICKERS)))
-    bay_ticker = st.selectbox(
-        "Тикер",
-        bay_tickers,
-        key="bay_ticker",
-        accept_new_options=True,
-        placeholder="Выберите или введите тикер...",
-    ).strip().upper()
-
-    if st.button("🚀 Сгенерировать сеть", type="primary", key="btn_gen_bayes"):
-        with st.spinner(f"Собираю данные и запрашиваю LLM для {bay_ticker}..."):
-            with get_db_context() as db:
-                result = run_bayesian_agent(db, bay_ticker)
-                saved_id = save_network_result(db, result) if result.get("valid") else None
-
-        if result.get("status") == "error":
-            st.error(f"Ошибка LLM: {result.get('error')}")
-        elif not result.get("valid"):
-            st.error("JSON не валиден:")
-            for e in result.get("errors", []):
-                st.error(f"  • {e}")
-        else:
-            st.success(f"✅ Сеть сгенерирована и сохранена (id={saved_id})")
-            for w in result.get("warnings", []):
-                st.warning(w)
-            _show_network(result.get("json"), bay_ticker, chart_key="generated")
-
-    st.divider()
-    st.markdown("**Сохранённые сети**")
-
-    view_all = st.checkbox(
-        "Показывать сети всех тикеров",
-        value=False,
-        key="bay_view_all",
-        help="По умолчанию — только сети выбранного выше тикера.",
-    )
-    # Материализуем строки в dict ДО закрытия сессии (иначе DetachedInstanceError
-    # при чтении атрибутов после выхода из with). Действие пересчитываем по
-    # сохранённым вероятностям (вдруг сохранено со старой логикой Up-vs-Down).
-    with get_db_context() as db:
-        saved = []
-        for d in get_saved_networks(
-            db, ticker=None if view_all else bay_ticker, limit=30
-        ):
-            action = d.action
-            infer = d.bayesian_inference_result or {}
-            probs = infer.get("probabilities") if isinstance(infer, dict) else None
-            if probs:
-                action, _ = bnv.action_from_probs(probs)
-            saved.append({
-                "label": (
-                    f"{d.created_at:%d.%m %H:%M} • {d.ticker} • {action} • "
-                    f"conf {d.confidence:.2f} • {d.bayesian_visualization or ''}"
-                ),
-                "ticker": d.ticker,
-                "structure": d.bayesian_network_structure,
-            })
-
-    if not saved:
-        scope = "всех тикеров" if view_all else f"«{bay_ticker}»"
-        st.caption(f"Сохранённых сетей {scope} нет. Сгенерируйте первую.")
-    else:
-        options = {row["label"]: row for row in saved}
-        sel_label = st.selectbox("Выбрать сохранённую сеть", list(options.keys()), key="bay_saved")
-        sel = options[sel_label]
-        _show_network(sel["structure"], sel["ticker"], chart_key="saved")
-
-
 with tab_account:
     st.subheader("💰 Счёт и портфель (песочница T-Invest)")
     st.caption(
         "Баланс и пополнение — счёт песочницы. Справа — текущие позиции "
-        "(шорты выделяются) и прошедшие шорты со всеми деталями и ссылками "
-        "на байесовские сети."
+        "(шорты выделяются) и прошедшие шорты."
     )
 
     # --- Аккаунт песочницы ---
@@ -634,33 +497,6 @@ with tab_account:
                         f"qty={abs(qty):g} avg={avg:,.2f} cur={cur:,.2f} "
                         f"PnL={yld:+,.2f} ₽"
                     )
-                    # Ссылка на байесовскую сеть по этому тикеру.
-                    # Материализуем поля в dict ДО закрытия сессии
-                    # (иначе DetachedInstanceError при чтении атрибутов).
-                    with get_db_context() as db:
-                        dec = (
-                            db.query(Decision)
-                            .filter(Decision.ticker == p["ticker"])
-                            .order_by(Decision.created_at.desc())
-                            .first()
-                        )
-                        if dec:
-                            dec_info = {
-                                "created_at": dec.created_at,
-                                "confidence": dec.confidence,
-                                "structure": dec.bayesian_network_structure,
-                            }
-                        else:
-                            dec_info = None
-                    if dec_info and dec_info["structure"]:
-                        with st.expander(
-                            f"🕸️ Байесовская сеть {p['ticker']} "
-                            f"({dec_info['created_at']:%d.%m %H:%M}, "
-                            f"conf {dec_info['confidence']:.2f})",
-                            expanded=False,
-                        ):
-                            _show_network(dec_info["structure"], p["ticker"],
-                                          chart_key=f"pos_{p['ticker']}")
 
             st.divider()
             st.markdown("**Прошедшие шорты**")
@@ -671,10 +507,6 @@ with tab_account:
                         "ticker": d.ticker,
                         "created_at": d.created_at,
                         "confidence": d.confidence,
-                        "probability_down": d.probability_down,
-                        "probability_up": d.probability_up,
-                        "structure": d.bayesian_network_structure,
-                        "id": d.id,
                     }
                     for d in (
                         db.query(Decision)
@@ -688,19 +520,7 @@ with tab_account:
                 st.caption("Прошедших шортов пока нет.")
             else:
                 for d in past_shorts:
-                    pd = d["probability_down"]
-                    pu = d["probability_up"]
-                    pd_s = f"{pd:.2f}" if pd is not None else "—"
-                    pu_s = f"{pu:.2f}" if pu is not None else "—"
                     st.markdown(
                         f"**{d['ticker']}** • {d['created_at']:%d.%m %H:%M} МСК • "
-                        f"conf={d['confidence']:.2f} • P(down)={pd_s} "
-                        f"P(up)={pu_s}"
+                        f"conf={d['confidence']:.2f}"
                     )
-                    if d["structure"]:
-                        with st.expander(
-                            f"🕸️ Сеть {d['ticker']} ({d['created_at']:%d.%m %H:%M})",
-                            expanded=False,
-                        ):
-                            _show_network(d["structure"], d["ticker"],
-                                          chart_key=f"past_{d['ticker']}_{d['id']}")

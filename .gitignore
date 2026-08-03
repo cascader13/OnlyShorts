@@ -11,9 +11,8 @@ credentials*
 .venv/
 venv/
 
-# === Базы данных ===
-data/*.db
-data/*.db-*
+# === Базы данных и рантайм-артефакты ===
+data/
 
 # === Кэш Python ===
 __pycache__/

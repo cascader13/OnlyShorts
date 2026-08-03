@@ -2,7 +2,9 @@
 CollectorScheduler — цикл реального времени для сбора новостей.
 
 Запускает collect_all() с заданным интервалом, корректно завершается
-по сигналу (Ctrl+C / SIGTERM).
+по сигналу (Ctrl+C / SIGTERM). Внутри одного прохода выполняется и весь
+остальной конвейер: анализ новостей, снапшоты и (если включена
+торговля) торговый цикл — решения -> сделки, мониторинг позиций.
 """
 
 import logging
@@ -11,7 +13,7 @@ import threading
 import time
 
 from app.core.config import settings
-from app.services.data_collector import DataCollector
+from app.services.data_collector import DataCollector, run_trading_cycle
 from app.core.database import get_db_context
 
 logger = logging.getLogger(__name__)
@@ -37,9 +39,20 @@ class CollectorScheduler:
         self._stopped = True
 
     def run_once(self) -> dict:
-        """Один проход сбора. Возвращает статистику."""
+        """Один проход: сбор + анализ + снапшоты + торговый цикл."""
         with get_db_context() as db:
-            return DataCollector(db).collect_all()
+            stats = DataCollector(db).collect_all()
+
+        # Если внутри collect_all торговый цикл не запускался (сбор упал до
+        # шага trading, а TRADING_ENABLED=True) — прогоняем его отдельно,
+        # чтобы открытые позиции мониторились и закрывались по расписанию.
+        if settings.TRADING_ENABLED and "trading" not in stats:
+            try:
+                with get_db_context() as db:
+                    stats["trading"] = run_trading_cycle(db)
+            except Exception:
+                logger.exception("Ошибка отдельного торгового цикла")
+        return stats
 
     def run(self):
         """Запускает бесконечный цикл сбора."""

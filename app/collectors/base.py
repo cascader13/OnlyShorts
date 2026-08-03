@@ -17,6 +17,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.timeutil import msk_now, to_naive_msk
 from app.models.news import RawNews
 
 logger = logging.getLogger(__name__)
@@ -29,15 +30,19 @@ def normalize_text(text: str) -> str:
 
 def parse_time(value: Optional[str]) -> Optional[datetime]:
     """
-    Разбирает время публикации из строки ISO8601.
+    Разбирает время публикации из строки ISO8601 и нормализует в naive МСК.
+
+    Значение с offset (Пульс: "+03:00", "Z") приводится к московскому времени;
+    naive-значение (MOEX ISS отдаёт уже по Москве) остаётся как есть.
     Возвращает None, если значение пустое или не удалось разобрать.
     """
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+    return to_naive_msk(dt)
 
 
 class BaseCollector:
@@ -129,7 +134,7 @@ class BaseCollector:
             external_id=external_id,
             hash_content=text_hash,
             is_duplicate=False,
-            created_at=datetime.utcnow(),
+            created_at=msk_now(),
         )
         self.db.add(raw)
 

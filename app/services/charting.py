@@ -12,6 +12,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from app.core.timeutil import MSK
+
 # Палитры по темам. Ключи: surface, grid, axis, ink, sma20, sma50, rsi,
 # up, down, muted.
 LIGHT_PALETTE: dict[str, str] = {
@@ -42,7 +44,11 @@ DARK_PALETTE: dict[str, str] = {
 
 
 def candles_to_df(rows) -> pd.DataFrame:
-    """Candle-объекты -> DataFrame с tz-aware UTC индексом (для plotly)."""
+    """Candle-объекты -> DataFrame с tz-aware МСК индексом (для plotly).
+
+    ts хранится в БД как naive МСК — локализуем в МСК, а не трактуем как UTC
+    (иначе метки времени на графике уедут на 3 часа назад).
+    """
     df = pd.DataFrame([
         {
             "ts": r.ts,
@@ -56,7 +62,9 @@ def candles_to_df(rows) -> pd.DataFrame:
     ])
     if df.empty:
         return df
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    ts = pd.to_datetime(df["ts"])
+    ts = ts.dt.tz_convert(MSK) if ts.dt.tz is not None else ts.dt.tz_localize(MSK)
+    df["ts"] = ts
     return df.set_index("ts").sort_index()
 
 

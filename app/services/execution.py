@@ -303,3 +303,83 @@ def get_order_state(account_id: str, order_id: str) -> dict:
         result["order_id"], result["status"], result["executed_quantity"],
     )
     return result
+
+
+# --- Сервис исполнения (для агента / position_manager) ---
+
+class ExecutionService:
+    """Сервис исполнения ордеров для одного счёта.
+
+    Тонкая обёртка над модульными функциями выше: держит account_id внутри,
+    чтобы вызывающему коду (агент, PositionManager) не передавать его в каждый
+    вызов. Возвращает те же структурированные dict, что и модульные функции.
+
+    paper=True — бумажный режим: ордера НЕ отправляются брокеру, а имитируются
+    (status=FILL, average_price=0.0 — вызывающий код подставляет свою цену).
+    Такой режим нужен для прогона агента без риска и без лишних вызовов API.
+    """
+
+    def __init__(self, account_id: str, paper: bool = False):
+        self.account_id = account_id
+        self.paper = paper
+
+    @property
+    def mode(self) -> str:
+        """Режим работы для логов: 'paper' или 'live'."""
+        return "paper" if self.paper else "live"
+
+    def open_short(self, ticker: str, quantity_lots: int) -> dict:
+        """Открывает шорт: продажа quantity_lots лотов по рынку."""
+        if self.paper:
+            return self._paper_order(ticker, quantity_lots,
+                                     OrderDirection.ORDER_DIRECTION_SELL)
+        return open_short(self.account_id, ticker, quantity_lots)
+
+    def close_short(self, ticker: str, quantity_lots: int) -> dict:
+        """Закрывает шорт: выкуп (cover) quantity_lots лотов по рынку."""
+        if self.paper:
+            return self._paper_order(ticker, quantity_lots,
+                                     OrderDirection.ORDER_DIRECTION_BUY)
+        return close_short(self.account_id, ticker, quantity_lots)
+
+    def cancel_order(self, order_id: str) -> dict:
+        """Отменяет активный ордер и возвращает его итоговое состояние."""
+        if self.paper:
+            return _order_result(order_id=order_id, status="CANCELLED",
+                                 message="paper: отменять нечего")
+        return cancel_order(self.account_id, order_id)
+
+    def get_order_state(self, order_id: str) -> dict:
+        """Текущее состояние ордера: статус, исполненный объём, средняя цена."""
+        if self.paper:
+            return _order_result(order_id=order_id, status="FILL",
+                                 message="paper: состояние не отслеживается")
+        return get_order_state(self.account_id, order_id)
+
+    def resolve_figi(self, ticker: str) -> str:
+        """Тикер -> FIGI (с фолбэком find_instrument)."""
+        return resolve_figi(ticker)
+
+    def get_lot_size(self, ticker: str) -> int:
+        """Размер лота инструмента по тикеру (целое число акций в лоте)."""
+        return get_lot_size(resolve_figi(ticker))
+
+    def _paper_order(self, ticker: str, quantity_lots: int,
+                     direction: OrderDirection) -> dict:
+        """Имитирует исполнение рыночного ордера, не трогая брокера.
+
+        average_price=0.0: фактическую цену подставляет вызывающий код
+        (агент при открытии, PositionManager при закрытии — у него уже есть
+        текущая цена). order_id помечается префиксом PAPER-.
+        """
+        logger.info(
+            "paper-ордер: %s %s lots=%d (на брокера не отправляется)",
+            direction.name, ticker, quantity_lots,
+        )
+        return _order_result(
+            order_id=f"PAPER-{uuid4()}",
+            status="FILL",
+            executed_quantity=int(quantity_lots),
+            average_price=0.0,
+            message="paper-исполнение (ордер не отправлялся)",
+        )

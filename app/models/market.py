@@ -5,13 +5,14 @@ Candle   — японские свечи по тикеру и таймфрейм
            (ticker, timeframe, ts): повторный сбор перезаписывает свечу).
 Instrument — кэш метаданных инструмента (для figi, имени, лота).
 
-Время хранится как naive UTC (конвенция проекта: SQLite хранит DateTime
-без offset). Конвертацию из timezone-aware значений SDK делают в сервисе.
+Время хранится как naive МСК (UTC+3, конвенция проекта: SQLite хранит
+DateTime без offset). Конвертацию из timezone-aware значений SDK в МСК
+делают в сервисе (app/core/timeutil.to_naive_msk).
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
@@ -25,11 +26,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
-
-
-def _utcnow() -> datetime:
-    """Наивное UTC-время (аналог datetime.utcnow без deprecation)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+from app.core.timeutil import msk_now
 
 
 class Instrument(Base):
@@ -63,8 +60,8 @@ class Instrument(Base):
         DateTime, nullable=True, comment="Дата самых ранних дневных свечей"
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=_utcnow, onupdate=_utcnow,
-        comment="Время обновления кэша (для TTL)",
+        DateTime, default=msk_now, onupdate=msk_now,
+        comment="Время обновления кэша (naive МСК, для TTL)",
     )
 
     def __repr__(self) -> str:
@@ -83,7 +80,7 @@ class Candle(Base):
         String(10), comment="Таймфрейм: 1d / 1h / 15m"
     )
     ts: Mapped[datetime] = mapped_column(
-        DateTime, comment="Время начала свечи, naive UTC"
+        DateTime, comment="Время начала свечи, naive МСК"
     )
     open: Mapped[float] = mapped_column(Float, comment="Цена открытия")
     high: Mapped[float] = mapped_column(Float, comment="Максимум")
@@ -95,7 +92,7 @@ class Candle(Base):
     is_complete: Mapped[bool] = mapped_column(
         Boolean, default=False, comment="Свеча завершена (у последней может быть False)"
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=msk_now, comment="naive МСК")
 
     __table_args__ = (
         # Ключ идемпотентного upsert и дедупликации; заодно создаёт индекс
